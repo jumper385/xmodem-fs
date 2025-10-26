@@ -59,6 +59,127 @@ def make_modem(ser, use_1k: bool, debug=False, crc_mode=True):
     
     return modem
 
+def cmd_diagnose(args):
+    """Run diagnostic tests on the serial connection"""
+    print("=== XMODEM Serial Diagnostics ===")
+    print(f"Port: {args.port}")
+    print(f"Baud: {args.baud}")
+    print(f"Timeout: {args.timeout}")
+    print()
+    
+    try:
+        ser = open_serial(args.port, args.baud, args.rtscts, args.dsrdtr, args.timeout)
+        print("✓ Serial port opened successfully")
+        
+        # Test 1: Basic connectivity
+        print("\n1. Testing basic connectivity...")
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        time.sleep(0.5)
+        
+        if ser.in_waiting > 0:
+            data = ser.read(ser.in_waiting)
+            print(f"   Found {len(data)} bytes in buffer: {data.hex()}")
+        else:
+            print("   No data in input buffer")
+        
+        # Test 2: Echo test
+        print("\n2. Testing echo response...")
+        test_bytes = b'\x01\x02\x03'
+        ser.write(test_bytes)
+        ser.flush()
+        time.sleep(0.2)
+        
+        response = ser.read(10)
+        if response:
+            print(f"   Echo response: {response.hex()}")
+        else:
+            print("   No echo response")
+        
+        # Test 3: XMODEM handshake
+        print("\n3. Testing XMODEM handshake signals...")
+        
+        # Clear buffer
+        if ser.in_waiting > 0:
+            ser.read(ser.in_waiting)
+        
+        # Send wake-up sequence
+        wake_seq = b'\r\n\x03\r\n'
+        ser.write(wake_seq)
+        ser.flush()
+        time.sleep(0.5)
+        
+        if ser.in_waiting > 0:
+            response = ser.read(ser.in_waiting)
+            print(f"   Wake-up response: {response.hex()}")
+            
+            # Analyze the response
+            for byte in response:
+                if byte == 0x15:
+                    print(f"   - Found NAK (0x15) - receiver wants checksum mode")
+                elif byte == 0x43:
+                    print(f"   - Found 'C' (0x43) - receiver wants CRC mode")
+                elif byte == 0x06:
+                    print(f"   - Found ACK (0x06) - unexpected, should be NAK or C")
+                elif byte == 0x18:
+                    print(f"   - Found CAN (0x18) - receiver is canceling")
+        else:
+            print("   No response to wake-up sequence")
+        
+        # Test 4: Continuous monitoring
+        print("\n4. Monitoring for XMODEM signals (5 seconds)...")
+        print("   (The receiver should be sending NAK or 'C' periodically)")
+        
+        start_time = time.time()
+        nak_count = 0
+        c_count = 0
+        other_bytes = []
+        
+        while time.time() - start_time < 5.0:
+            if ser.in_waiting > 0:
+                data = ser.read(ser.in_waiting)
+                for byte in data:
+                    if byte == 0x15:
+                        nak_count += 1
+                    elif byte == 0x43:
+                        c_count += 1
+                    else:
+                        other_bytes.append(byte)
+            time.sleep(0.1)
+        
+        print(f"   NAK (0x15) count: {nak_count}")
+        print(f"   'C' (0x43) count: {c_count}")
+        if other_bytes:
+            print(f"   Other bytes: {[hex(b) for b in other_bytes[:10]]}")
+        
+        # Recommendations
+        print("\n=== Recommendations ===")
+        if nak_count > 0:
+            print("✓ Receiver is active and requesting checksum mode")
+            print("  Try: --checksum flag")
+        elif c_count > 0:
+            print("✓ Receiver is active and requesting CRC mode") 
+            print("  Try: normal mode (default)")
+        elif other_bytes:
+            print("? Receiver is sending data but not XMODEM signals")
+            print("  - Check if receiver is in correct mode")
+            print("  - Try different baud rates")
+        else:
+            print("✗ No XMODEM signals detected")
+            print("  - Verify receiver is connected and powered")
+            print("  - Check if receiver program is running")
+            print("  - Try different baud rates: 9600, 19200, 38400")
+            print("  - Check cable connections")
+        
+        ser.close()
+        print("\n✓ Diagnostics completed")
+        
+    except Exception as e:
+        print(f"✗ Diagnostic error: {e}")
+        return False
+    
+    return True
+
 def human(n):
     for unit in ["B","KB","MB","GB"]:
         if n < 1024.0:
@@ -247,6 +368,9 @@ def main():
     sp_recv.add_argument("--out", "-o", required=True, help="Output file path")
     sp_recv.add_argument("--force", "-f", action="store_true", help="Overwrite output if exists")
     sp_recv.set_defaults(func=cmd_recv)
+
+    sp_diagnose = sub.add_parser("diagnose", parents=[common], help="Run diagnostic tests on serial connection")
+    sp_diagnose.set_defaults(func=cmd_diagnose)
 
     args = p.parse_args()
     try:
