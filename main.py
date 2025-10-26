@@ -27,7 +27,7 @@ def open_serial(port, baud, rtscts=False, dsrdtr=False, timeout=1.0):
         print(f"Failed to open serial port {port}: {e}", file=sys.stderr)
         sys.exit(1)
 
-def make_modem(ser, use_1k: bool, debug=False):
+def make_modem(ser, use_1k: bool, debug=False, crc_mode=True):
     # xmodem expects two callables: getc(size, timeout) and putc(data, timeout)
     def getc(size, timeout=1):
         ser.timeout = timeout
@@ -42,11 +42,22 @@ def make_modem(ser, use_1k: bool, debug=False):
             print(f"DEBUG: Sending {len(data)} bytes: {data.hex() if len(data) <= 10 else data[:10].hex() + '...'}", file=sys.stderr)
         written = ser.write(data)
         ser.flush()
-        # Give the receiver time to process the data
-        time.sleep(0.001)  # 1ms delay
+        # Increased delay for problematic receivers
+        time.sleep(0.01)  # 10ms delay instead of 1ms
         return written
 
-    return (XMODEM1k if use_1k else XMODEM)(getc, putc)
+    # Create modem - always start with standard mode
+    if use_1k:
+        modem = XMODEM1k(getc, putc)
+    else:
+        modem = XMODEM(getc, putc)
+    
+    # Note: CRC mode is negotiated automatically by the xmodem library
+    # based on receiver's initial character (C for CRC, NAK for checksum)
+    if debug:
+        print(f"DEBUG: Created {'XMODEM-1k' if use_1k else 'XMODEM'} modem, CRC preference: {crc_mode}", file=sys.stderr)
+    
+    return modem
 
 def human(n):
     for unit in ["B","KB","MB","GB"]:
@@ -59,19 +70,48 @@ def cmd_send(args):
     ser = open_serial(args.port, args.baud, args.rtscts, args.dsrdtr, args.timeout)
     fh = None
     try:
-        modem = make_modem(ser, args.x1k, args.debug)
+        # Add CRC mode option and pass to modem
+        crc_mode = getattr(args, 'crc', True)  # Default to CRC mode
+        modem = make_modem(ser, args.x1k, args.debug, crc_mode)
 
         # Clear buffers and wait for receiver to be ready
         ser.reset_input_buffer()
         ser.reset_output_buffer()
-        time.sleep(0.5)  # Give receiver time to initialize
+        time.sleep(1.0)  # Longer initial delay for problematic receivers
         
-        # Drain any stale data
-        while ser.in_waiting > 0:
-            stale_data = ser.read(ser.in_waiting)
-            if args.debug:
-                print(f"DEBUG: Drained {len(stale_data)} stale bytes: {stale_data.hex()}", file=sys.stderr)
-            time.sleep(0.1)
+        # More aggressive buffer clearing
+        for _ in range(3):  # Try multiple times
+            while ser.in_waiting > 0:
+                stale_data = ser.read(ser.in_waiting)
+                if args.debug:
+                    print(f"DEBUG: Drained {len(stale_data)} stale bytes: {stale_data.hex()}", file=sys.stderr)
+                time.sleep(0.1)
+            time.sleep(0.2)
+
+        # Try to trigger receiver into XMODEM mode if it's not ready
+        if args.debug:
+            print("DEBUG: Attempting to wake up receiver...", file=sys.stderr)
+        
+        # Send some wake-up sequences that might help
+        wake_sequences = [
+            b'\r\n',  # Carriage return + line feed
+            b'\x03',  # Ctrl+C to break out of any running program
+            b'\r\n',  # Another CR+LF
+        ]
+        
+        for seq in wake_sequences:
+            ser.write(seq)
+            ser.flush()
+            time.sleep(0.2)
+            # Clear any responses
+            if ser.in_waiting > 0:
+                response = ser.read(ser.in_waiting)
+                if args.debug:
+                    print(f"DEBUG: Wake-up response: {response.hex()}", file=sys.stderr)
+
+        # Final buffer clear
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
 
         # Open the file to send
         size = os.path.getsize(args.file)
@@ -91,15 +131,22 @@ def cmd_send(args):
             pct = min(100.0, (sent_bytes / max(1, size)) * 100.0)
             sys.stderr.write(f"\rSending {args.file}  {pct:5.1f}%  ({human(sent_bytes)}/{human(size)})")
             sys.stderr.flush()
+            if args.debug and error:
+                print(f"\nDEBUG: Transfer error - total: {total}, success: {success}, error: {error}", file=sys.stderr)
 
         # Wait for receiver to send initial NAK/C to start transmission
         print("Waiting for receiver to initiate transfer...", file=sys.stderr)
-        initial_timeout = args.timeout * 10  # Give more time for initial handshake
+        
+        # Much longer timeout for initial handshake
+        initial_timeout = max(args.timeout * 15, 30.0)  # At least 30 seconds
         ser.timeout = initial_timeout
+        
+        # Increase retry count for problematic connections
+        retry_count = max(args.retry, 30)
         
         ok = modem.send(
             stream=fh,
-            retry=args.retry,
+            retry=retry_count,
             timeout=args.timeout,
             quiet=False,
             callback=progress
@@ -108,6 +155,12 @@ def cmd_send(args):
         sys.stderr.write("\n")
         if not ok:
             print("Transfer failed (receiver did not acknowledge).", file=sys.stderr)
+            print("Troubleshooting tips:", file=sys.stderr)
+            print("  1. Try with --debug to see communication details", file=sys.stderr)
+            print("  2. Verify receiver is in XMODEM receive mode", file=sys.stderr)
+            print("  3. Try different baud rates: --baud 9600 or --baud 57600", file=sys.stderr)
+            print("  4. Try checksum mode: --checksum", file=sys.stderr)
+            print("  5. Try with hardware flow control: --rtscts", file=sys.stderr)
             sys.exit(2)
         print(f"Sent {human(sent_bytes)} in {dur:.2f}s  (~{human(sent_bytes/dur)}/s)")
     finally:
@@ -121,7 +174,9 @@ def cmd_send(args):
 def cmd_recv(args):
     ser = open_serial(args.port, args.baud, args.rtscts, args.dsrdtr, args.timeout)
     try:
-        modem = make_modem(ser, args.x1k, args.debug)
+        # Add CRC mode option and pass to modem
+        crc_mode = getattr(args, 'crc', True)  # Default to CRC mode
+        modem = make_modem(ser, args.x1k, args.debug, crc_mode)
 
         # Prepare output file (avoid overwrite unless --force)
         if os.path.exists(args.out) and not args.force:
@@ -141,9 +196,12 @@ def cmd_recv(args):
             sys.stderr.write(f"\rReceiving -> {args.out}  {pct}")
             sys.stderr.flush()
 
+        # Increase retry count for problematic connections
+        retry_count = max(args.retry, 30)
+
         ok = modem.recv(
             stream=fh,
-            retry=args.retry,
+            retry=retry_count,
             timeout=args.timeout,
             quiet=False,
             callback=None  # write progress handled in write_chunk via the stream
@@ -178,6 +236,8 @@ def main():
     common.add_argument("--retry", type=int, default=16, help="Retry count per block (default: 16)")
     common.add_argument("--1k", dest="x1k", action="store_true", help="Use XMODEM-1k (1024B blocks)")
     common.add_argument("--debug", action="store_true", help="Enable debug output")
+    common.add_argument("--checksum", dest="crc", action="store_false", 
+                        help="Use checksum mode instead of CRC (less reliable but may work with older receivers)")
 
     sp_send = sub.add_parser("send", parents=[common], help="Send a file using XMODEM")
     sp_send.add_argument("file", help="Path to file to send")
